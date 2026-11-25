@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Schwarzes Loch</title>
+<!--
+  Schwarzes Loch – interaktive Visualisierung für den Galadriel-Kiosk.
+  Umgesetzt nach dem Besuchervorschlag „Schwarzes Loch Visualizer“.
+
+  Für jeden Bildpunkt wird die Bahn eines Lichtstrahls im Schwarzschild-
+  Raum berechnet: In der Bahnebene gilt für u = 1/r (Einheiten G = c = M = 1)
+      u''(φ) + u = 3 u²
+  (Binet-Gleichung der Allgemeinen Relativitätstheorie), gelöst mit dem
+  klassischen Runge-Kutta-Verfahren 4. Ordnung. Trifft der Strahl die
+  Akkretionsscheibe, wird deren Licht mit Doppler-Effekt und
+  gravitativer Rotverschiebung eingefärbt; fällt er unter r = 2 (Ereignis-
+  horizont), bleibt der Punkt schwarz; sonst zeigt er den (verzerrten)
+  Sternenhimmel.
+  Reines Canvas-2D (kein WebGL), läuft damit auch in WebKitGTK ohne
+  beschleunigtes Compositing.
+-->
+<style>
+  :root {
+    --blue: #344A9A;
+    --panel: rgba(10, 14, 32, 0.78);
+    --text: #f2f4fb;
+    --muted: #b9c1e0;
+    --accent: #ffb347;
+  }
+  * { box-sizing: border-box; -webkit-user-select: none; user-select: none; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: #000;
+    color: var(--text); font-family: 'Inter', 'DejaVu Sans', sans-serif;
+    touch-action: none;
+  }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  #hud {
+    position: fixed; left: 32px; top: 24px; max-width: 46vw; pointer-events: none;
+    text-shadow: 0 2px 8px #000;
+  }
+  #hud h1 { margin: 0; font-size: 44px; font-weight: 800; letter-spacing: .5px; }
+  #hud p  { margin: 6px 0 0; font-size: 19px; color: var(--muted); }
+  #busy {
+    position: fixed; right: 110px; top: 30px; padding: 10px 18px; border-radius: 22px;
+    background: var(--panel); font-size: 17px; color: var(--muted); display: none;
+  }
+  #bar {
+    position: fixed; left: 0; right: 0; bottom: 22px; margin: 0 auto; width: fit-content;
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: center;
+    padding: 12px 14px; border-radius: 20px; background: var(--panel);
+    max-width: calc(100vw - 32px);
+  }
+  .sep { width: 2px; height: 44px; background: rgba(255,255,255,.18); margin: 0 4px; }
+  button {
+    font: inherit; font-size: 19px; font-weight: 700; color: var(--text);
+    background: rgba(255,255,255,.08); border: 2px solid rgba(255,255,255,.22);
+    border-radius: 14px; padding: 0 20px; height: 60px; min-width: 60px; cursor: pointer;
+  }
+  button:active { transform: scale(.96); }
+  button.on { background: var(--blue); border-color: #6f86da; }
+  button.info { background: var(--accent); color: #1b1b1b; border-color: var(--accent); }
+  #hint {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, 130px);
+    padding: 12px 22px; border-radius: 30px; background: var(--panel);
+    font-size: 20px; color: var(--muted); pointer-events: none; transition: opacity 1s;
+  }
+  #info {
+    position: fixed; inset: 0; background: rgba(0, 0, 0, .72); display: none;
+    align-items: center; justify-content: center; padding: 24px;
+  }
+  #info.open { display: flex; }
+  #info .card {
+    background: #11162c; border: 2px solid #2b3a78; border-radius: 22px;
+    max-width: 1100px; width: 100%; max-height: 92vh; overflow: auto;
+    padding: 34px 44px 28px;
+  }
+  #info h2 { margin: 0 0 14px; font-size: 34px; color: var(--accent); }
+  #info h3 { margin: 22px 0 6px; font-size: 23px; color: #fff; }
+  #info p, #info li { font-size: 19px; line-height: 1.5; color: #d6dbef; margin: 4px 0; }
+  #info .eq { font-family: 'DejaVu Serif', serif; font-size: 24px; color: #fff; text-align: center; margin: 10px 0; }
+  #info .foot { margin-top: 22px; font-size: 16px; color: var(--muted); }
+  #info .close { margin-top: 20px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="hud">
+  <h1 data-t="title"></h1>
+  <p data-t="subtitle"></p>
+</div>
+<div id="busy"></div>
+<div id="hint" data-t="hint"></div>
+
+<div id="bar">
+  <button data-view="3"  data-t="side"></button>
+  <button data-view="17" data-t="tilt"></button>
+  <button data-view="80" data-t="top"></button>
+  <div class="sep"></div>
+  <button id="nearer" aria-label="näher">＋</button>
+  <button id="farther" aria-label="weiter">－</button>
+  <div class="sep"></div>
+  <button id="tDisk" class="on" data-t="disk"></button>
+  <button id="tDoppler" class="on" data-t="doppler"></button>
+  <div class="sep"></div>
+  <button id="infoBtn" class="info" data-t="what"></button>
+  <button id="lang">EN</button>
+</div>
+
+<div id="info"><div class="card" id="infoCard"></div></div>
+
+<script>
+'use strict';
+
+// ---------------------------------------------------------------- Texte
+const TEXT = {
+  de: {
+    title: 'Schwarzes Loch',
+    subtitle: 'Wie Licht sich um ein Schwarzes Loch krümmt',
+    hint: 'Mit dem Finger ziehen: drehen und neigen',
+    side: 'Von der Seite', tilt: 'Schräg', top: 'Von oben',
+    disk: 'Scheibe', doppler: 'Doppler', what: 'Was sehe ich?',
+    busy: 'Berechne Lichtbahnen … ',
+    info: `
+      <h2>Was sehe ich hier?</h2>
+      <p>Ein <b>Schwarzes Loch</b> ist so kompakt, dass nicht einmal Licht ihm entkommen kann.
+      Um es herum kreist eine heiße <b>Akkretionsscheibe</b> aus Gas. Für jeden Bildpunkt hat der
+      Computer ausgerechnet, welchen Weg das Licht genommen hat.</p>
+      <h3>Der schwarze Schatten</h3>
+      <p>Lichtstrahlen, die zu nahe vorbeikommen, fallen hinter den <b>Ereignishorizont</b>
+      (Schwarzschild-Radius r<sub>s</sub> = 2GM/c²) und kommen nie wieder heraus.
+      Der Schatten erscheint etwa <b>2,6-mal so groß</b> wie der Horizont selbst: Die Schwerkraft
+      wirkt wie eine Lupe.</p>
+      <h3>Die Scheibe über und unter dem Loch</h3>
+      <p>Der helle Bogen über dem Schatten ist die <b>Rückseite</b> der Scheibe: Ihr Licht wird
+      über das Loch hinweg zu uns gebogen (<b>Gravitationslinse</b>). Auch die Sterne dahinter
+      erscheinen verzerrt und verdoppelt – schalte die Scheibe aus, um den Einstein-Ring zu sehen.</p>
+      <h3>Warum ist eine Seite heller?</h3>
+      <p>Das Gas kreist mit bis zur Hälfte der Lichtgeschwindigkeit. Die Seite, die sich auf uns
+      zubewegt (hier rechts), erscheint durch den <b>Doppler-Effekt</b> heller und bläulicher,
+      die andere dunkler und röter. Dazu kommt die <b>gravitative Rotverschiebung</b>: Licht verliert
+      Energie, wenn es aus dem Schwerefeld herausklettert.</p>
+      <h3>Die Mathematik dahinter</h3>
+      <p>In der Allgemeinen Relativitätstheorie gehorcht ein Lichtstrahl in seiner Bahnebene der
+      Gleichung (mit u = 1/r, Einheiten G = c = M = 1):</p>
+      <div class="eq">u″(φ) + u = 3u²</div>
+      <p>Ohne den Term 3u² wäre die Bahn eine gerade Linie. Die Gleichung wird für jeden Bildpunkt
+      mit dem <b>Runge-Kutta-Verfahren</b> numerisch gelöst – hier für über 200 000 Lichtstrahlen.</p>
+      <p class="foot">Umgesetzt nach einem Besuchervorschlag aus der Feedback-Abstimmung am Kiosk.
+      Mathematisches Institut, Universität Freiburg.</p>`,
+    close: 'Schließen',
+  },
+  en: {
+    title: 'Black Hole',
+    subtitle: 'How light bends around a black hole',
+    hint: 'Drag with your finger: rotate and tilt',
+    side: 'Side view', tilt: 'Tilted', top: 'From above',
+    disk: 'Disk', doppler: 'Doppler', what: 'What am I seeing?',
+    busy: 'Tracing light rays … ',
+    info: `
+      <h2>What am I seeing?</h2>
+      <p>A <b>black hole</b> is so compact that not even light can escape it. Around it orbits a
+      hot <b>accretion disk</b> of gas. For every pixel the computer has calculated the path the
+      light has taken.</p>
+      <h3>The black shadow</h3>
+      <p>Light rays passing too close fall behind the <b>event horizon</b>
+      (Schwarzschild radius r<sub>s</sub> = 2GM/c²) and never come back out. The shadow appears
+      about <b>2.6 times larger</b> than the horizon itself: gravity acts like a magnifying glass.</p>
+      <h3>The disk above and below the hole</h3>
+      <p>The bright arc above the shadow is the <b>far side</b> of the disk: its light is bent
+      over the hole towards us (<b>gravitational lensing</b>). Stars behind it also appear
+      distorted and doubled – switch off the disk to see the Einstein ring.</p>
+      <h3>Why is one side brighter?</h3>
+      <p>The gas orbits at up to half the speed of light. The side moving towards us (here: right)
+      appears brighter and bluer because of the <b>Doppler effect</b>, the other side dimmer and
+      redder. On top of that comes <b>gravitational redshift</b>: light loses energy while
+      climbing out of the gravitational field.</p>
+      <h3>The mathematics behind it</h3>
+      <p>In general relativity, a light ray in its orbital plane obeys the equation
+      (with u = 1/r, units G = c = M = 1):</p>
+      <div class="eq">u″(φ) + u = 3u²</div>
+      <p>Without the term 3u² the path would be a straight line. The equation is solved
+      numerically for every pixel with the <b>Runge–Kutta method</b> – here for more than
+      200,000 light rays.</p>
+      <p class="foot">Built from a visitor suggestion in the kiosk feedback poll.
+      Mathematical Institute, University of Freiburg.</p>`,
+    close: 'Close',
+  },
+};
+let lang = 'de';
+function applyLang() {
+  const T = TEXT[lang];
+  document.documentElement.lang = lang;
+  document.querySelectorAll('[data-t]').forEach(el => { el.textContent = T[el.dataset.t]; });
+  document.getElementById('lang').textContent = lang === 'de' ? 'EN' : 'DE';
+  document.getElementById('infoCard').innerHTML =
+    T.info + `<button class="close info" onclick="toggleInfo(false)">${T.close}</button>`;
+}
+
+// ---------------------------------------------------------------- Zustand
+const RIN = 6;          // innerste stabile Kreisbahn (ISCO) = 3 r_s
+const ROUT = 18;        // Außenrand der Scheibe
+const state = {
+  incl: 10 * Math.PI / 180,   // Blickwinkel über der Scheibenebene
+  dist: 32,                   // Abstand Kamera – Loch (in M)
+  yaw: 0,                     // Drehung um die Achse (billig, ohne Neuberechnung)
+  disk: true,
+  doppler: true,
+};
+const INCL_MIN = 2 * Math.PI / 180, INCL_MAX = 85 * Math.PI / 180;
+const DIST_MIN = 16, DIST_MAX = 70;
+
+// ---------------------------------------------------------------- Canvas
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const off = document.createElement('canvas');
+const offCtx = off.getContext('2d');
+const glow = document.createElement('canvas');
+const glowCtx = glow.getContext('2d');
+let W = 0, H = 0, fineScale = 3;
+
+function resize() {
+  W = cv.width = window.innerWidth;
+  H = cv.height = window.innerHeight;
+  // Ziel ~ 640 Strahlen in der Breite (1920 px -> Faktor 3)
+  fineScale = Math.max(2, Math.round(W / 640));
+  restart(true);
+}
+
+// ---------------------------------------------------------------- Sternenhimmel
+// Äquirektanguläre Textur (Länge x Breite), einmalig prozedural erzeugt.
+const SW = 2048, SH = 1024;
+const sky = new Float32Array(SW * SH * 3);
+function rng(seed) { return () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296); }
+function buildSky() {
+  const rand = rng(12345);
+  // Milchstraße: Band um einen geneigten Großkreis
+  const nx = 0.2, ny = 0.85, nz = 0.48, nl = Math.hypot(nx, ny, nz);
+  for (let j = 0; j < SH; j++) {
+    const lat = Math.PI / 2 - (j + 0.5) / SH * Math.PI;
+    const cl = Math.cos(lat), sl = Math.sin(lat);
+    for (let i = 0; i < SW; i++) {
+      const lon = (i + 0.5) / SW * 2 * Math.PI - Math.PI;
+      const x = cl * Math.cos(lon), y = sl, z = cl * Math.sin(lon);
+      const d = (x * nx + y * ny + z * nz) / nl;
+      const wob = 0.5 + 0.5 * Math.sin(lon * 7 + Math.sin(lon * 3) * 2) * Math.cos(lat * 9);
+      const band = Math.exp(-d * d / 0.018) * (0.55 + 0.45 * wob);
+      const k = (j * SW + i) * 3;
+      sky[k]     = 0.0015 + 0.030 * band;
+      sky[k + 1] = 0.0020 + 0.028 * band;
+      sky[k + 2] = 0.0045 + 0.038 * band;
+    }
+  }
+  // Sterne gleichverteilt auf der Kugel, Helligkeit nach Potenzgesetz
+  for (let s = 0; s < 9000; s++) {
+    const lat = Math.asin(2 * rand() - 1), lon = rand() * 2 * Math.PI - Math.PI;
+    const i = Math.floor((lon + Math.PI) / (2 * Math.PI) * SW) % SW;
+    const j = Math.min(SH - 1, Math.floor((Math.PI / 2 - lat) / Math.PI * SH));
+    const b = 0.25 + 3.5 * Math.pow(rand(), 9);
+    const t = rand();   // Farbe: rötlich .. bläulich
+    const r = b * (t < 0.3 ? 1.0 : t < 0.8 ? 0.92 : 0.75);
+    const g = b * (t < 0.3 ? 0.78 : t < 0.8 ? 0.92 : 0.85);
+    const bl = b * (t < 0.3 ? 0.6 : t < 0.8 ? 0.95 : 1.0);
+    const put = (ii, jj, f) => {
+      const k = (jj * SW + ((ii + SW) % SW)) * 3;
+      sky[k] += r * f; sky[k + 1] += g * f; sky[k + 2] += bl * f;
+    };
+    // weicher Stern (kleiner Gauß-Fleck) statt Einzelpixel -> kein Flimmern/Strichbildung
+    // Gewichte auf Summe 1.6 normiert: Gesamthelligkeit wie ein heller Einzelpixel
+    const rad = 1, sig2 = b > 1.2 ? 0.7 : 0.45;
+    let wsum = 0;
+    for (let dj = -rad; dj <= rad; dj++)
+      for (let di = -rad; di <= rad; di++) wsum += Math.exp(-(di * di + dj * dj) / (2 * sig2));
+    for (let dj = -rad; dj <= rad; dj++) {
+      if (j + dj < 0 || j + dj >= SH) continue;
+      for (let di = -rad; di <= rad; di++)
+        put(i + di, j + dj, 1.6 * Math.exp(-(di * di + dj * dj) / (2 * sig2)) / wsum);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- Scheibenstruktur
+// Rauschtextur in (Radius, Winkel): radial feine Ringe, azimutal lange Schlieren.
+const NR = 128, NA = 512;
+const diskTex = new Float32Array(NR * NA);
+function buildDiskTex() {
+  const rand = rng(777);
+  const waves = [];
+  for (let n = 0; n < 26; n++) {
+    waves.push({
+      kr: 1 + rand() * 10,                  // radiale Frequenz
+      ka: Math.floor(1 + rand() * 14),       // azimutale Frequenz (ganzzahlig: periodisch)
+      tw: (rand() - 0.5) * 30,              // Verdrillung (Spiralen)
+      ph: rand() * 2 * Math.PI,
+      a: 0.2 + rand() * 0.8,
+    });
+  }
+  let min = 1e9, max = -1e9;
+  for (let ir = 0; ir < NR; ir++) {
+    const x = ir / NR;
+    for (let ia = 0; ia < NA; ia++) {
+      const t = ia / NA * 2 * Math.PI;
+      let v = 0;
+      for (const w of waves) v += w.a * Math.sin(w.kr * x * 6.283 + w.ka * t + w.tw * x + w.ph);
+      diskTex[ir * NA + ia] = v;
+      if (v < min) min = v; if (v > max) max = v;
+    }
+  }
+  for (let k = 0; k < diskTex.length; k++) {
+    const v = (diskTex[k] - min) / (max - min);
+    diskTex[k] = 0.35 + 1.3 * v * v;
+  }
+}
+
+// ---------------------------------------------------------------- Strahlverfolgung
+// Pro Bildpunkt gespeichert: Hintergrund-Richtung (lon/lat) oder Horizont,
+// sowie bis zu zwei Durchstoßpunkte durch die Scheibe (Radius, Winkel, g-Faktor).
+function makeMap(w, h) {
+  const n = w * h;
+  return {
+    w, h,
+    hole: new Uint8Array(n),
+    lon: new Float32Array(n), lat: new Float32Array(n),
+    // pro Durchstoß k (0 = vorne, 1 = dahinter): Treffer?, Winkel, Doppler-g, nur-Gravitation-g,
+    // sowie vorberechnet: Radius-Index der Textur, Winkelgeschwindigkeit, Grundtemperatur, Randtransparenz
+    hit: [new Uint8Array(n), new Uint8Array(n)],
+    ang: [new Float32Array(n), new Float32Array(n)],
+    g:   [new Float32Array(n), new Float32Array(n)],
+    gg:  [new Float32Array(n), new Float32Array(n)],
+    ir:  [new Uint8Array(n), new Uint8Array(n)],
+    om:  [new Float32Array(n), new Float32Array(n)],
+    tb:  [new Float32Array(n), new Float32Array(n)],
+    ed:  [new Float32Array(n), new Float32Array(n)],
+  };
+}
+
+function camera(incl, dist, w, h) {
+  const si = Math.sin(incl), ci = Math.cos(incl);
+  // Kamera bei C = dist*(0, sin i, cos i), Blick zum Ursprung; Scheibe in der x-z-Ebene.
+  const f = [0, -si, -ci], right = [1, 0, 0], up = [0, ci, -si];
+  const tanH = Math.tan(30 * Math.PI / 180) * Math.min(1.25, Math.max(0.7, dist / 32));
+  return { e1: [0, si, ci], f, right, up, dist, tanH, aspect: w / h, w, h };
+}
+
+const STEP = 0.022;
+const MAXSTEPS = Math.ceil(5 * Math.PI / STEP);
+
+function traceRow(map, cam, py) {
+  const { w, h } = map;
+  const e1 = cam.e1, f = cam.f, R = cam.right, U = cam.up;
+  const u0 = 1 / cam.dist;
+  const uEsc = 1 / Math.max(cam.dist * 1.6, 90);
+  const sy = (1 - 2 * (py + 0.5) / h) * cam.tanH;
+  for (let px = 0; px < w; px++) {
+    const idx = py * w + px;
+    const sx = (2 * (px + 0.5) / w - 1) * cam.tanH * cam.aspect;
+    let dx = f[0] + sx * R[0] + sy * U[0];
+    let dy = f[1] + sx * R[1] + sy * U[1];
+    let dz = f[2] + sx * R[2] + sy * U[2];
+    const dl = Math.hypot(dx, dy, dz); dx /= dl; dy /= dl; dz /= dl;
+
+    // Bahnebene: e1 (radial bei der Kamera), e2 (senkrecht dazu, in Strahlrichtung)
+    const a = dx * e1[0] + dy * e1[1] + dz * e1[2];
+    let vx = dx - a * e1[0], vy = dy - a * e1[1], vz = dz - a * e1[2];
+    const b = Math.hypot(vx, vy, vz);
+    map.hit[0][idx] = 0; map.hit[1][idx] = 0; map.hole[idx] = 0;
+    if (b < 1e-9) { map.hole[idx] = 1; continue; }
+    vx /= b; vy /= b; vz /= b;
+    const e2 = [vx, vy, vz];
+
+    let u = u0, du = -u0 * a / b, phi = 0;
+    let sPrev = e1[1];                    // y-Komponente der Bahnrichtung bei φ = 0
+    let hits = 0, fate = 0;               // fate: 1 = Horizont, 2 = entkommen
+
+    for (let n = 0; n < MAXSTEPS; n++) {
+      // RK4 für u'' = -u + 3u²
+      const h1 = STEP;
+      const k1u = du,                     k1v = -u + 3 * u * u;
+      let uu = u + 0.5 * h1 * k1u, vv = du + 0.5 * h1 * k1v;
+      const k2u = vv,                     k2v = -uu + 3 * uu * uu;
+      uu = u + 0.5 * h1 * k2u; vv = du + 0.5 * h1 * k2v;
+      const k3u = vv,                     k3v = -uu + 3 * uu * uu;
+      uu = u + h1 * k3u; vv = du + h1 * k3v;
+      const k4u = vv,                     k4v = -uu + 3 * uu * uu;
+      const nu = u + h1 / 6 * (k1u + 2 * k2u + 2 * k3u + k4u);
+      const ndu = du + h1 / 6 * (k1v + 2 * k2v + 2 * k3v + k4v);
+      const nphi = phi + h1;
+      const cn = Math.cos(nphi), sn = Math.sin(nphi);
+      const sNew = cn * e1[1] + sn * e2[1];
+
+      // Durchstoß durch die Scheibenebene y = 0?
+      if (hits < 2 && sPrev * sNew < 0) {
+        const t = sPrev / (sPrev - sNew);
+        const uc = u + (nu - u) * t;
+        if (uc > 0) {
+          const rc = 1 / uc;
+          if (rc > RIN && rc < ROUT) {
+            const pc = phi + STEP * t, cc = Math.cos(pc), sc = Math.sin(pc);
+            const px3 = rc * (cc * e1[0] + sc * e2[0]);
+            const pz3 = rc * (cc * e1[2] + sc * e2[2]);
+            const ang = Math.atan2(pz3, px3);
+            // Ausbreitungsrichtung des verfolgten Strahls (Kamera -> Scheibe)
+            const duc = du + (ndu - du) * t;
+            const drdphi = -duc / (uc * uc);
+            let tx = drdphi * (cc * e1[0] + sc * e2[0]) + rc * (-sc * e1[0] + cc * e2[0]);
+            let tz = drdphi * (cc * e1[2] + sc * e2[2]) + rc * (-sc * e1[2] + cc * e2[2]);
+            let ty = drdphi * (cc * e1[1] + sc * e2[1]) + rc * (-sc * e1[1] + cc * e2[1]);
+            const tl = Math.hypot(tx, ty, tz); tx /= tl; tz /= tl;
+            // Photon fliegt umgekehrt (Scheibe -> Kamera): k = -t.
+            // Gasgeschwindigkeit (Kepler, Schwarzschild): beta = 1/sqrt(r-2), Richtung (-sin, 0, cos).
+            const beta = 1 / Math.sqrt(rc - 2);
+            const cosT = -(-Math.sin(ang) * tx + Math.cos(ang) * tz);
+            const grav = Math.sqrt(1 - 3 / rc);                 // = sqrt(1-2/r) / gamma
+            const g = grav / (1 - beta * cosT);
+            map.hit[hits][idx] = 1;
+            map.ang[hits][idx] = ang;
+            map.g[hits][idx] = g;
+            map.gg[hits][idx] = grav;
+            map.ir[hits][idx] = Math.min(NR - 1, Math.floor((rc - RIN) / (ROUT - RIN) * NR));
+            map.om[hits][idx] = 1.6 * Math.pow(rc / RIN, -1.5);     // Kepler: Ω ∝ r^-3/2
+            map.tb[hits][idx] = tProfile(rc) / T_PEAK;
+            map.ed[hits][idx] = Math.min(1, (rc - RIN) / 0.8) * Math.min(1, (ROUT - rc) / 3);
+            hits++;
+          }
+        }
+      }
+      u = nu; du = ndu; phi = nphi; sPrev = sNew;
+      if (u >= 0.5) { fate = 1; break; }                    // r <= 2: Ereignishorizont
+      if (u <= 0 || (u < uEsc && du < 0)) { fate = 2; break; }
+    }
+
+    if (fate !== 2) { map.hole[idx] = 1; continue; }     // gefangen (oder Photonensphäre)
+    const c = Math.cos(phi), s = Math.sin(phi);
+    const drdphi = -du / (u * u), r = 1 / Math.max(u, 1e-9);
+    const ox = drdphi * (c * e1[0] + s * e2[0]) + r * (-s * e1[0] + c * e2[0]);
+    const oy = drdphi * (c * e1[1] + s * e2[1]) + r * (-s * e1[1] + c * e2[1]);
+    const oz = drdphi * (c * e1[2] + s * e2[2]) + r * (-s * e1[2] + c * e2[2]);
+    const ol = Math.hypot(ox, oy, oz);
+    map.lon[idx] = Math.atan2(oz / ol, ox / ol);
+    map.lat[idx] = Math.asin(Math.max(-1, Math.min(1, oy / ol)));
+  }
+}
+
+// ---------------------------------------------------------------- Aufbau (schrittweise)
+let shown = null;       // aktuell angezeigte Karte
+let job = null;         // in Arbeit: {map, cam, row, fine}
+function startJob(scale, fine) {
+  const w = Math.max(16, Math.round(W / scale)), h = Math.max(9, Math.round(H / scale));
+  job = { map: makeMap(w, h), cam: camera(state.incl, state.dist, w, h), row: 0, fine, t0: performance.now() };
+}
+function restart(withCoarse) {
+  if (withCoarse) {
+    // grobe Vorschau sofort, dann fein
+    startJob(fineScale * 4, false);
+    while (job.row < job.map.h) traceRow(job.map, job.cam, job.row++);
+    shown = job.map;
+  }
+  startJob(fineScale, true);
+}
+function work(budgetMs) {
+  if (!job) return;
+  const end = performance.now() + budgetMs;
+  while (job.row < job.map.h && performance.now() < end) traceRow(job.map, job.cam, job.row++);
+  const busy = document.getElementById('busy');
+  if (job.row >= job.map.h) {
+    // für Tests/Diagnose: Dauer der letzten vollständigen Berechnung
+    window.__lastTraceMs = Math.round(performance.now() - job.t0);
+    shown = job.map; job = null; busy.style.display = 'none';
+  } else if (job.fine && performance.now() - job.t0 > 400) {
+    busy.style.display = 'block';
+    busy.textContent = TEXT[lang].busy + Math.round(100 * job.row / job.map.h) + ' %';
+  }
+}
+
+// ---------------------------------------------------------------- Einfärben
+// Farbe eines Schwarzkörpers grob nach relativer Temperatur x (1 = Referenz).
+const PAL = [
+  [0.00, [0.0, 0.0, 0.0]], [0.35, [0.55, 0.06, 0.0]], [0.60, [1.0, 0.33, 0.04]],
+  [0.85, [1.0, 0.66, 0.30]], [1.10, [1.0, 0.90, 0.75]], [1.45, [0.92, 0.95, 1.0]],
+  [2.20, [0.65, 0.75, 1.0]],
+];
+const LUT_N = 512, LUT_MAX = 2.2, lut = new Float32Array(LUT_N * 3);
+(function buildLut() {
+  for (let i = 0; i < LUT_N; i++) {
+    const x = i / (LUT_N - 1) * LUT_MAX;
+    let k = 0; while (k < PAL.length - 2 && x > PAL[k + 1][0]) k++;
+    const [x0, c0] = PAL[k], [x1, c1] = PAL[k + 1];
+    const t = Math.min(1, Math.max(0, (x - x0) / (x1 - x0)));
+    for (let c = 0; c < 3; c++) lut[i * 3 + c] = c0[c] + (c1[c] - c0[c]) * t;
+  }
+})();
+// Temperaturprofil einer dünnen Scheibe: T ∝ r^(-3/4) (1 - sqrt(r_in/r))^(1/4)
+function tProfile(r) { return Math.pow(r, -0.75) * Math.pow(Math.max(0, 1 - Math.sqrt(RIN / r)), 0.25); }
+let T_PEAK = 0;
+for (let r = RIN; r < ROUT; r += 0.01) T_PEAK = Math.max(T_PEAK, tProfile(r));
+
+const TWO_PI = 2 * Math.PI;
+const disk = [0, 0, 0, 0];
+function shadeDisk(m, k, i, dop, time, yaw) {
+  let t = (m.ang[k][i] + yaw - m.om[k][i] * time) / TWO_PI; t -= Math.floor(t);
+  const noise = diskTex[m.ir[k][i] * NA + ((t * NA) | 0) % NA];
+  const temp = m.tb[k][i] * (dop ? m.g[k][i] : m.gg[k][i]);  // beobachtete Temperatur
+  const t2 = temp * temp;
+  const exposure = 1 - Math.exp(-1.3 * t2 * t2 * noise);   // Helligkeit ∝ T^4
+  const li = Math.min(LUT_N - 1, (temp / LUT_MAX * (LUT_N - 1)) | 0) * 3;
+  disk[0] = lut[li] * exposure * 1.15;
+  disk[1] = lut[li + 1] * exposure * 1.15;
+  disk[2] = lut[li + 2] * exposure * 1.15;
+  disk[3] = Math.min(1, m.ed[k][i] * (0.85 + 0.15 * noise));
+}
+
+let imgData = null;
+function render(time) {
+  const m = shown;
+  if (!m) return;
+  if (off.width !== m.w || off.height !== m.h || !imgData) {
+    off.width = m.w; off.height = m.h;
+    imgData = offCtx.createImageData(m.w, m.h);
+  }
+  const px = imgData.data, yaw = state.yaw, n = m.w * m.h;
+  const useDisk = state.disk, dop = state.doppler;
+  for (let i = 0; i < n; i++) {
+    let r = 0, g = 0, b = 0;
+    if (!m.hole[i]) {
+      let lon = m.lon[i] + yaw;
+      // bilineare Abtastung der Himmelstextur
+      let fx = ((lon + Math.PI) / TWO_PI) * SW - 0.5;
+      fx -= Math.floor(fx / SW) * SW;
+      const fy = Math.min(SH - 1.001, Math.max(0, (Math.PI / 2 - m.lat[i]) / Math.PI * SH - 0.5));
+      const x0 = fx | 0, y0 = fy | 0, tx = fx - x0, ty = fy - y0;
+      const x1 = x0 + 1 === SW ? 0 : x0 + 1;
+      const k00 = (y0 * SW + x0) * 3, k10 = (y0 * SW + x1) * 3;
+      const k01 = k00 + SW * 3, k11 = k10 + SW * 3;
+      const w00 = (1 - tx) * (1 - ty), w10 = tx * (1 - ty), w01 = (1 - tx) * ty, w11 = tx * ty;
+      r = sky[k00] * w00 + sky[k10] * w10 + sky[k01] * w01 + sky[k11] * w11;
+      g = sky[k00 + 1] * w00 + sky[k10 + 1] * w10 + sky[k01 + 1] * w01 + sky[k11 + 1] * w11;
+      b = sky[k00 + 2] * w00 + sky[k10 + 2] * w10 + sky[k01 + 2] * w01 + sky[k11 + 2] * w11;
+    }
+    if (useDisk) {
+      // erst den hinteren (zweiten) Durchstoß, dann den vorderen darüber
+      if (m.hit[1][i]) {
+        shadeDisk(m, 1, i, dop, time, yaw);
+        const a = disk[3]; r = r * (1 - a) + disk[0] * a; g = g * (1 - a) + disk[1] * a; b = b * (1 - a) + disk[2] * a;
+      }
+      if (m.hit[0][i]) {
+        shadeDisk(m, 0, i, dop, time, yaw);
+        const a = disk[3]; r = r * (1 - a) + disk[0] * a; g = g * (1 - a) + disk[1] * a; b = b * (1 - a) + disk[2] * a;
+      }
+    }
+    const o = i * 4;
+    px[o]     = r >= 1 ? 255 : 255 * Math.sqrt(r);    // einfache Gamma-Korrektur
+    px[o + 1] = g >= 1 ? 255 : 255 * Math.sqrt(g);
+    px[o + 2] = b >= 1 ? 255 : 255 * Math.sqrt(b);
+    px[o + 3] = 255;
+  }
+  offCtx.putImageData(imgData, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(off, 0, 0, W, H);
+  // leichtes Leuchten: stark verkleinerte (= weichgezeichnete) Kopie additiv darüber
+  const gw = Math.max(8, Math.round(m.w / 8)), gh = Math.max(5, Math.round(m.h / 8));
+  if (glow.width !== gw || glow.height !== gh) { glow.width = gw; glow.height = gh; }
+  glowCtx.imageSmoothingEnabled = true;
+  glowCtx.drawImage(off, 0, 0, gw, gh);
+  ctx.globalAlpha = 0.3;
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.drawImage(glow, 0, 0, W, H);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+}
+
+// ---------------------------------------------------------------- Bedienung
+let dragging = false, lastX = 0, lastY = 0, lastTouch = performance.now();
+let pendingRestart = false, lastCoarse = 0;
+function onParamChange() { pendingRestart = true; }
+
+cv.addEventListener('pointerdown', e => {
+  dragging = true; lastX = e.clientX; lastY = e.clientY; lastTouch = performance.now();
+  try { cv.setPointerCapture(e.pointerId); } catch (_) {}
+  hideHint();
+});
+cv.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  const dx = e.clientX - lastX, dy = e.clientY - lastY;
+  lastX = e.clientX; lastY = e.clientY; lastTouch = performance.now();
+  state.yaw -= dx * 0.005;
+  if (dy !== 0) {
+    const ni = Math.min(INCL_MAX, Math.max(INCL_MIN, state.incl + dy * 0.004));
+    if (ni !== state.incl) { state.incl = ni; onParamChange(); }
+  }
+});
+const endDrag = () => { dragging = false; lastTouch = performance.now(); };
+cv.addEventListener('pointerup', endDrag);
+cv.addEventListener('pointercancel', endDrag);
+
+document.querySelectorAll('[data-view]').forEach(btn => btn.addEventListener('click', () => {
+  state.incl = Number(btn.dataset.view) * Math.PI / 180; onParamChange(); lastTouch = performance.now();
+}));
+document.getElementById('nearer').addEventListener('click', () => {
+  state.dist = Math.max(DIST_MIN, state.dist / 1.2); onParamChange();
+});
+document.getElementById('farther').addEventListener('click', () => {
+  state.dist = Math.min(DIST_MAX, state.dist * 1.2); onParamChange();
+});
+function toggleBtn(id, key) {
+  const el = document.getElementById(id);
+  el.addEventListener('click', () => { state[key] = !state[key]; el.classList.toggle('on', state[key]); });
+}
+toggleBtn('tDisk', 'disk');
+toggleBtn('tDoppler', 'doppler');
+document.getElementById('lang').addEventListener('click', () => { lang = lang === 'de' ? 'en' : 'de'; applyLang(); });
+function toggleInfo(open) { document.getElementById('info').classList.toggle('open', open); }
+document.getElementById('infoBtn').addEventListener('click', () => toggleInfo(true));
+document.getElementById('info').addEventListener('click', e => { if (e.target.id === 'info') toggleInfo(false); });
+
+let hintHidden = false;
+function hideHint() { if (!hintHidden) { hintHidden = true; document.getElementById('hint').style.opacity = 0; } }
+setTimeout(hideHint, 9000);
+
+// ---------------------------------------------------------------- Hauptschleife
+let simTime = 0, lastFrame = performance.now();
+function frame(now) {
+  const dt = Math.min(0.1, (now - lastFrame) / 1000); lastFrame = now;
+  simTime += dt;
+  // Ohne Berührung dreht sich die Ansicht langsam weiter
+  if (!dragging && now - lastTouch > 4000) state.yaw += dt * 0.03;
+
+  if (pendingRestart && now - lastCoarse > 60) {
+    pendingRestart = false; lastCoarse = now;
+    restart(true);
+  }
+  work(dragging ? 8 : 22);
+  render(simTime);
+  requestAnimationFrame(frame);
+}
+
+window.toggleInfo = toggleInfo;
+applyLang();
+buildSky();
+buildDiskTex();
+window.addEventListener('resize', resize);
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
